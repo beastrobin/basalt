@@ -809,7 +809,7 @@ def _closes_again(rest: str, final: bool) -> bool | None:
     return False if final or opener >= 0 else None
 
 
-def param_end(text: str, final: bool = False, name: str | None = None) -> int:
+def param_end(text: str, final: bool = False, name: str | None = None, close_reopened: bool = False) -> int:
     """Find a structural parameter close, keeping quoted calls, a reopened parameter and a quoted whole call close
     inside its value. -1: none yet; -2: candidate awaiting more output. `final` falls back to the plain structural
     close."""
@@ -822,7 +822,7 @@ def param_end(text: str, final: bool = False, name: str | None = None) -> int:
             gt = after.find(">")
             if gt < 0:
                 candidate = at if final else -2
-            elif name is None or after[len(PARAM_START):gt].strip() != name:
+            elif name is None or close_reopened or after[len(PARAM_START):gt].strip() != name:
                 candidate = at
         elif after.startswith(FUNC_END):
             end = _full_close_end(text, at)
@@ -845,7 +845,7 @@ def param_end(text: str, final: bool = False, name: str | None = None) -> int:
     return fallback if final else (-2 if fallback >= 0 else -1)
 
 
-def call_end(text: str, final: bool = False) -> int:
+def call_end(text: str, final: bool = False, props: dict | None = None) -> int:
     """Where a call body ends: the `</tool_call>` after its own `</function>` (found via param_end); -1: incomplete.
     A body not in the call format ends at the first `</tool_call>`."""
     s = text.lstrip()
@@ -864,7 +864,10 @@ def call_end(text: str, final: bool = False) -> int:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:], final=final, name=text[pos:gt].split("=", 1)[1].strip())
+            key = text[pos:gt].split("=", 1)[1].strip()
+            prop = (props or {}).get(key)
+            close_reopened = prop is not None and not _text_kinds(prop)[0]
+            end = param_end(text[gt + 1:], final=final, name=key, close_reopened=close_reopened)
             if end < 0:
                 return -1
             pos = gt + 1 + end + len(PARAM_END)
@@ -1044,13 +1047,17 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     rest = body[body.index(">") + 1:]
     props = _tool_properties(schema)
     args = {}
+    seen = set()
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
         # the body stops before its </tool_call>: put it back, so a quoted whole close inside a value is told from
         # the real one the same way as in the output
-        end = param_end(rest + "\n" + CALL_END, final=True, name=pname.strip())
+        key = pname.strip()
+        prop = props.get(key)
+        close_reopened = prop is not None and not _text_kinds(prop)[0]
+        end = param_end(rest + "\n" + CALL_END, final=True, name=key, close_reopened=close_reopened)
         end = end if end < len(rest) else -1
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len(PARAM_END):] if end >= 0 else ""
@@ -1058,7 +1065,10 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        args[pname] = _decode_param(value, props.get(pname))
+        if key in seen:
+            continue
+        seen.add(key)
+        args[key] = _decode_param(value, props.get(key))
     return ToolCall(name=name, arguments=args)
 
 
@@ -1332,6 +1342,8 @@ class OutputParser(CodeTracker):
         self.sdeclared = {}
         self.spname = ""
         self.svstart = 0
+        self.sseen_params: set[str] = set()
+        self.sclose_reopened = False
         self._call_parts = []
         self._call_has_end = False
         self._call_tail = ""
@@ -1381,11 +1393,16 @@ class OutputParser(CodeTracker):
                     if b < 0:
                         return out
                     pname = stripped[11:b]
-                    args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
-                    self.sfirst = False
                     self.sp += b + 1
                     self.spname = pname
                     text, null = _text_kinds(self.sdeclared.get(pname))
+                    self.sclose_reopened = not text
+                    if pname.strip() in self.sseen_params:
+                        self.ss = "skip"
+                        continue
+                    self.sseen_params.add(pname.strip())
+                    args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
+                    self.sfirst = False
                     if text and not null:
                         args('"')
                         self.ss, self.sval_started = "str", False
@@ -1406,7 +1423,8 @@ class OutputParser(CodeTracker):
                         rest = rest[1:]
                     self.sval_started = True
                     self.svstart = self.sp
-                end = param_end(self.buf[self.svstart:], final=final, name=self.spname) if PARAM_END in rest else -1
+                end = param_end(self.buf[self.svstart:], final=final, name=self.spname,
+                                close_reopened=self.sclose_reopened) if PARAM_END in rest else -1
                 end = end - (self.sp - self.svstart) if end >= 0 else end
                 if end >= 0:
                     value = rest[:end]
@@ -1425,7 +1443,8 @@ class OutputParser(CodeTracker):
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest, final=final, name=self.spname) if PARAM_END in rest else -1
+                end = param_end(rest, final=final, name=self.spname,
+                                close_reopened=self.sclose_reopened) if PARAM_END in rest else -1
                 if end < 0:
                     return out
                 value = rest[:end]
@@ -1434,6 +1453,12 @@ class OutputParser(CodeTracker):
                 if value.endswith("\n"):
                     value = value[:-1]
                 args(json.dumps(_decode_param(value, self.sdeclared.get(self.spname)), ensure_ascii=False))
+                self.sp += end + len(PARAM_END)
+                self.ss = "between"
+            elif self.ss == "skip":
+                end = param_end(rest, final=final, name=self.spname.strip(), close_reopened=self.sclose_reopened)
+                if end < 0:
+                    return out
                 self.sp += end + len(PARAM_END)
                 self.ss = "between"
             else:
@@ -1570,7 +1595,10 @@ class OutputParser(CodeTracker):
                 self._call_has_end = CALL_END in self._buf
                 self._call_tail = self._buf[-(len(CALL_END) - 1):]
             else:
-                i = call_end(self.buf, final=final) if self._call_has_end else -1
+                body = self.buf.strip()
+                name = body[len("<function="):].split(">", 1)[0] if body.startswith("<function=") else ""
+                i = call_end(self.buf, final=final,
+                             props=_tool_properties(self.schemas.get(name))) if self._call_has_end else -1
                 if self.stream_tools:
                     if i >= 0:
                         # scan only the call, closed: its </tool_call> tells a quoted close inside a value
